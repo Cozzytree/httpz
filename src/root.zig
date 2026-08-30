@@ -3,22 +3,55 @@ const Io = std.Io;
 const Router = @import("router.zig");
 const Method = std.http.Method;
 
+pub const Error = error{
+    InvalidJson,
+    PayloadTooLarge,
+};
+
+pub const ResponseCookie = struct {
+    secure: bool = false,
+    http_only: bool = false,
+
+    name: []const u8,
+    value: []const u8,
+    domain: ?[]const u8 = null,
+
+    max_age: ?i64 = null,
+    path: ?[]const u8 = "/",
+
+    same_site: ?[]const u8 = "Lax",
+};
+
 pub const Param = struct {
     key: []const u8,
     value: []const u8,
 };
 
+const Query = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 pub const Request = struct {
+    _body_cache: ?[]const u8 = null,
+    max_body_size: usize = 1024 * 1024,
     io: std.Io,
     raw: *std.http.Server.Request,
     allocator: std.mem.Allocator,
-    // params: std.StringHashMapUnmanaged([]const u8) = .empty,
     params: []Param = &.{},
     values: std.StringHashMapUnmanaged(*const anyopaque) = .empty,
+    response_cookies: std.ArrayListUnmanaged(ResponseCookie) = .empty,
     app_state: ?*anyopaque = null,
+
     cookie_parsed: bool = false,
+    // lazily loaded
     cookies: std.StringHashMapUnmanaged([]const u8) = .empty,
 
+    // lazily loaded when called query() for the first time
+    queries: std.ArrayListUnmanaged(Query) = .empty,
+    query_parsed: bool = false,
+
+    // cookies
     fn parseCookie(self: *Request) !void {
         self.cookie_parsed = true;
         if (self.header("cookie")) |cookie_header| {
@@ -29,6 +62,18 @@ pub const Request = struct {
                 try self.cookies.put(self.allocator, trimmed[0..idx], trimmed[idx + 1 ..]);
             }
         }
+    }
+
+    pub fn setCookie(self: *Request, res_cookie: ResponseCookie) !void {
+        try self.response_cookies.append(self.allocator, res_cookie);
+    }
+
+    pub fn deleteCookie(self: *Request, name: []const u8) !void {
+        try self.setCookie(.{
+            .name = name,
+            .value = "",
+            .max_age = 0,
+        });
     }
 
     pub fn cookie(self: *Request, key: []const u8) ?[]const u8 {
@@ -57,6 +102,8 @@ pub const Request = struct {
 
     pub fn deinit(self: *Request) void {
         self.values.deinit(self.allocator);
+        self.cookies.deinit(self.allocator);
+        self.queries.deinit(self.allocator);
     }
 
     pub fn method(self: *const Request) Method {
@@ -75,18 +122,49 @@ pub const Request = struct {
         return tar;
     }
 
-    pub fn query(self: *const Request) []const u8 {
+    fn parseQuery(self: *Request) !void {
+        self.query_parsed = true;
         const tar = self.target();
-        if (std.mem.indexOfScalar(u8, tar, '?')) |index| {
-            return tar[index + 1 ..];
+
+        const idx = std.mem.findScalar(u8, tar, '?') orelse return;
+        const query_str = tar[idx + 1 ..];
+        var pair_it = std.mem.splitScalar(u8, query_str, '&');
+        while (pair_it.next()) |pair| {
+            if (pair.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, pair, '=');
+            if (eq) |i| {
+                try self.queries.append(self.allocator, .{
+                    .key = pair[0..i],
+                    .value = pair[i + 1 ..],
+                });
+            } else {
+                try self.queries.append(
+                    self.allocator,
+                    .{
+                        .key = pair,
+                        .value = "",
+                    },
+                );
+            }
         }
-        return "";
+    }
+
+    pub fn query(self: *Request, key: []const u8) ?[]const u8 {
+        if (!self.query_parsed) {
+            self.parseQuery() catch return null;
+        }
+
+        for (self.queries.items) |q| {
+            std.debug.print("KEY={s}, VAL={s}\n", .{ q.key, q.value });
+            if (std.mem.eql(u8, key, q.key)) return q.value;
+        }
+        return null;
     }
 
     pub fn header(self: *const Request, name: []const u8) ?[]const u8 {
         var it = self.raw.iterateHeaders();
         while (it.next()) |head| {
-            if (std.mem.eql(u8, head.name, name)) return head.value;
+            if (std.ascii.eqlIgnoreCase(head.name, name)) return head.value;
         }
         return null;
     }
@@ -121,7 +199,77 @@ pub const Request = struct {
     pub fn rawBody(_: *Request) ![]const u8 {
         return null;
     }
+
+    // utitlities
+    pub fn redirect(self: *const Request, uri: []const u8, status: std.http.Status) !void {
+        try self.raw.respond("", .{
+            .status = status,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = uri },
+            },
+        });
+    }
+
+    pub fn body(self: *Request) ![]const u8 {
+        if (self._body_cache) |cached_body| {
+            return cached_body;
+        }
+
+        var transfer_buff: [4096]u8 = undefined;
+        var reader = try self.raw.readerExpectContinue(&transfer_buff);
+
+        const data = reader.allocRemaining(
+            self.allocator,
+            .limited(self.max_body_size),
+        ) catch |err| switch (err) {
+            Io.Reader.LimitedAllocError.StreamTooLong => return Error.PayloadTooLarge,
+            else => return err,
+        };
+
+        self._body_cache = data;
+        return data;
+    }
+
+    pub fn jsonBody(self: *Request, comptime T: type) !T {
+        const data = try self.body();
+        const parsed = try std.json.parseFromSlice(
+            T,
+            self.allocator,
+            data,
+            .{ .ignore_unknown_fields = true },
+        );
+        return parsed.value;
+    }
+
+    pub fn respondJson(self: *Request, value: anytype) !void {
+        var writer = Io.Writer.Allocating.init(self.allocator);
+
+        var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try json.write(value);
+
+        var headers = std.ArrayListUnmanaged(std.http.Header).empty;
+
+        var cookie_storage = Io.Writer.Allocating.init(self.allocator);
+
+        for (self.response_cookies.items) |res_cookie| {
+            const start = cookie_storage.written().len;
+            try write_cookie(&cookie_storage.writer, res_cookie);
+
+            const end = cookie_storage.written().len;
+            try headers.append(self.allocator, .{
+                .name = "Set-Cookie",
+                .value = cookie_storage.written()[start..end],
+            });
+        }
+        try headers.append(self.allocator, .{ .name = "Content-Type", .value = "application/json" });
+
+        try self.raw.respond(writer.written(), .{
+            .status = .ok,
+            .extra_headers = headers.items,
+        });
+    }
 };
+
 pub const Handler = *const fn (*Request) anyerror!void;
 pub const Middleware = *const fn (*Request, next: *Next) anyerror!void;
 
@@ -162,6 +310,7 @@ const Options = struct {
     host: []const u8,
     allocator: std.mem.Allocator,
     app_state: ?*anyopaque,
+    max_body_size: usize = 1024 * 1024,
 };
 
 const Group = struct {
@@ -224,6 +373,7 @@ pub const Server = struct {
     address: Io.net.IpAddress,
     router: Router,
     allocator: std.mem.Allocator,
+    max_body_size: usize,
 
     pub fn init(options: Options) !Server {
         return .{
@@ -231,6 +381,7 @@ pub const Server = struct {
             .allocator = options.allocator,
             .router = try Router.init(),
             .app_state = options.app_state,
+            .max_body_size = options.max_body_size,
         };
     }
 
@@ -313,6 +464,7 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
             .io = io,
             .raw = &head,
             .app_state = server.app_state,
+            .max_body_size = server.max_body_size,
         };
         defer request.deinit();
 
@@ -321,8 +473,10 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
         };
         var params_len: usize = 0;
 
+        const path = stripQuery(head.head.target);
+        std.debug.print("PTH={s}\n", .{path});
         const match = server.router.find(
-            head.head.target,
+            path,
             head.head.method,
             params_buf,
             &params_len,
@@ -353,11 +507,35 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
             .route = match.route.middlewares.items,
             .handler = match.handler,
         };
-        chain.call(&request) catch {
+        chain.call(&request) catch |err| {
+            std.debug.print("HANDLER ERROR={any}\n", .{err});
             head.respond("INTERNAL SERVER ERROR\n", .{
                 .status = .internal_server_error,
             }) catch return;
             return;
         };
     }
+}
+
+fn stripQuery(target: []const u8) []const u8 {
+    return if (std.mem.indexOfScalar(u8, target, '?')) |idx|
+        target[0..idx]
+    else
+        target;
+}
+
+fn write_cookie(writer: *Io.Writer, cookie: ResponseCookie) !void {
+    try writer.print("{s}={s}", .{ cookie.name, cookie.value });
+
+    if (cookie.path) |path| try writer.print("; Path={s}", .{path});
+
+    if (cookie.domain) |domain| try writer.print("; Domain={s}", .{domain});
+
+    if (cookie.max_age) |max_age| try writer.print("; Max-Age={d}", .{max_age});
+
+    if (cookie.http_only) try writer.writeAll("; HttpOnly");
+
+    if (cookie.secure) try writer.writeAll("; Secure");
+
+    if (cookie.same_site) |same_site| try writer.print("; SameSite={s}", .{same_site});
 }

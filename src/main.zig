@@ -78,11 +78,28 @@ fn user_handler(req: *httpz.Request) !void {
 }
 
 fn home(req: *httpz.Request) !void {
-    try req.raw.respond("{ \"name\":\"cozzycod\" }\n", .{
-        .extra_headers = &.{
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .status = .ok,
+    _ = req.query("");
+    for (req.queries.items) |page| {
+        std.debug.print("{s}={s}\n", .{ page.key, page.value });
+    }
+    try req.raw.respond("OK", .{});
+}
+
+const User = struct {
+    username: []const u8,
+    password: []const u8,
+};
+
+fn createUser(req: *httpz.Request) !void {
+    const body = try req.jsonBody(User);
+    try req.respondJson(body);
+}
+
+fn user(req: *httpz.Request) !void {
+    const id = req.param("id").?;
+    try req.setCookie(.{ .name = "apple", .value = "maple" });
+    try req.respondJson(.{
+        .userId = id,
     });
 }
 
@@ -100,20 +117,16 @@ pub fn main(init: std.process.Init) !void {
         .app_state = &app_state,
     });
 
-    // try server.USE(logger);
-    // try server.USE(logger1);
-    // try server.USE(logger2);
-    // try server.USE(logger3);
-    // try server.USE(logger4);
     try server.GET("/", home);
     try server.GET("/users", handle_user);
-    try server.GET("/users/:id", handle_user_id);
+    try server.GET("/users/:id", user);
     std.debug.print("Server listening in port {d}\n", .{3000});
 
     var api = server.GROUP("/api");
     try api.GET("/", api_handler);
 
     var user_api = try api.GROUP("/user");
+    try user_api.POST("/", createUser);
     try user_api.GET("/", user_handler);
 
     try server.run(io);
