@@ -87,7 +87,7 @@ fn home(w: httpz.ResponseWriter, req: *httpz.Request) !void {
     try w.header().set("APPLE", "MAPLE");
     w.writeHeader(200);
 
-    _ = try w.write("Hello ");
+    _ = try w.write("");
     _ = try w.write(" World");
 }
 
@@ -121,6 +121,7 @@ pub fn main(init: std.process.Init) !void {
         .port = 3000,
         .allocator = init.gpa,
         .app_state = &app_state,
+        .read_header_timeout = 2000,
     });
 
     try server.GET("/", home);

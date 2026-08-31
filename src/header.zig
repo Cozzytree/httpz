@@ -20,7 +20,7 @@ pub fn get(this: *const Header, key: []const u8) []const u8 {
     if (vals.items.len == 0)
         return "";
 
-    return values.items[0];
+    return vals.items[0];
 }
 
 // Returns all values associated with the key
@@ -108,4 +108,30 @@ pub fn generate_headers(this: *Header, allocator: std.mem.Allocator) ![]std.http
     }
 
     return result.toOwnedSlice(allocator);
+}
+
+test "test 1" {
+    const allocator = std.testing.allocator;
+    var h: Header = .{
+        .allocator = allocator,
+        .headers = .empty,
+    };
+    defer h.deinit();
+
+    _ = try h.set("Content-Type", "application/json");
+    const data = h.get("content-type");
+    try std.testing.expectEqualStrings("application/json", data);
+
+    try h.append("content-type", "utf-8");
+
+    const d2 = h.values("content-type");
+    try std.testing.expectEqual(@as(usize, 2), d2.len);
+    try std.testing.expectEqualStrings(
+        "application/json",
+        d2[0],
+    );
+    try std.testing.expectEqualStrings(
+        "utf-8",
+        d2[1],
+    );
 }

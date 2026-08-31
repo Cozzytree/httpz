@@ -337,6 +337,7 @@ const Options = struct {
     allocator: std.mem.Allocator,
     app_state: ?*anyopaque,
     max_body_size: usize = 1024 * 1024,
+    read_header_timeout: ?i64 = null,
 };
 
 const Group = struct {
@@ -399,6 +400,7 @@ pub const Server = struct {
     address: Io.net.IpAddress,
     router: Router,
     allocator: std.mem.Allocator,
+    read_header_timeout: ?i64 = null,
     max_body_size: usize,
 
     pub fn init(options: Options) !Server {
@@ -408,6 +410,7 @@ pub const Server = struct {
             .router = try Router.init(),
             .app_state = options.app_state,
             .max_body_size = options.max_body_size,
+            .read_header_timeout = options.read_header_timeout,
         };
     }
 
@@ -459,6 +462,11 @@ pub const Server = struct {
     }
 };
 
+const Result = union(enum) {
+    request: std.http.Server.ReceiveHeadError!std.http.Server.Request,
+    timeout: Io.Cancelable!void,
+};
+
 fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Canceled}!void {
     defer stream.close(io);
 
@@ -470,18 +478,44 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
 
     var writer = stream.writer(io, &write_buffer);
     var reader = stream.reader(io, &read_buffer);
-
     var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
+
     while (http_server.reader.state == .ready) {
         defer _ = arena.reset(.retain_capacity);
         const req_alloc = arena.allocator();
 
-        var head = http_server.receiveHead() catch |err| switch (err) {
-            error.HttpConnectionClosing => {
-                return;
-            },
-            else => {
+        var storage: [2]Result = undefined;
+        var select = Io.Select(Result).init(io, &storage);
+        defer _ = select.cancel();
+
+        select.concurrent(.request, receiveHeadTask, .{&http_server}) catch {
+            return error.Canceled;
+        };
+
+        if (server.read_header_timeout) |timeout_ms| {
+            select.concurrent(
+                .timeout,
+                timeoutTask,
+                .{
+                    io,
+                    Io.Duration.fromMilliseconds(timeout_ms),
+                },
+            ) catch {
                 return error.Canceled;
+            };
+        }
+
+        var head = switch (try select.await()) {
+            .request => |req| req catch {
+                return error.Canceled;
+            },
+
+            .timeout => |res| {
+                res catch {
+                    return error.Canceled;
+                };
+                std.log.debug("header timeout", .{});
+                return;
             },
         };
 
@@ -554,6 +588,16 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
             return;
         };
     }
+}
+
+fn receiveHeadTask(
+    server: *std.http.Server,
+) std.http.Server.ReceiveHeadError!std.http.Server.Request {
+    return try server.receiveHead();
+}
+
+fn timeoutTask(io: Io, duration: Io.Duration) Io.Cancelable!void {
+    try io.sleep(duration, .real);
 }
 
 fn stripQuery(target: []const u8) []const u8 {
