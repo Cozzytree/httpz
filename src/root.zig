@@ -2,10 +2,35 @@ const std = @import("std");
 const Io = std.Io;
 const Router = @import("router.zig");
 const Method = std.http.Method;
+const Headers = @import("./header.zig");
+const Response = @import("response.zig");
 
 pub const Error = error{
     InvalidJson,
     PayloadTooLarge,
+};
+
+pub const ResponseWriter = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    const VTable = struct {
+        header: *const fn (ptr: *anyopaque) *Headers,
+        write: *const fn (ptr: *anyopaque, data: []const u8) anyerror!usize,
+        writeHeader: *const fn (ptr: *anyopaque, status: u16) void,
+    };
+
+    pub fn header(self: ResponseWriter) *Headers {
+        return self.vtable.header(self.ptr);
+    }
+
+    pub fn write(self: ResponseWriter, data: []const u8) !usize {
+        return self.vtable.write(self.ptr, data);
+    }
+
+    pub fn writeHeader(self: ResponseWriter, status: u16) void {
+        self.vtable.writeHeader(self.ptr, status);
+    }
 };
 
 pub const ResponseCookie = struct {
@@ -97,6 +122,7 @@ pub const Request = struct {
             .allocator = allocator,
             .raw = raw,
             .io = io,
+            .header = Headers.init(allocator),
         };
     }
 
@@ -155,7 +181,6 @@ pub const Request = struct {
         }
 
         for (self.queries.items) |q| {
-            std.debug.print("KEY={s}, VAL={s}\n", .{ q.key, q.value });
             if (std.mem.eql(u8, key, q.key)) return q.value;
         }
         return null;
@@ -270,8 +295,8 @@ pub const Request = struct {
     }
 };
 
-pub const Handler = *const fn (*Request) anyerror!void;
-pub const Middleware = *const fn (*Request, next: *Next) anyerror!void;
+pub const Handler = *const fn (ResponseWriter, *Request) anyerror!void;
+pub const Middleware = *const fn (ResponseWriter, *Request, next: *Next) anyerror!void;
 
 pub const Next = struct {
     global: []const Middleware,
@@ -288,6 +313,7 @@ pub const Next = struct {
 
     pub fn call(
         self: *Next,
+        response_writer: ResponseWriter,
         req: *Request,
     ) !void {
         const total =
@@ -295,13 +321,13 @@ pub const Next = struct {
             self.route.len;
 
         if (self.index >= total) {
-            return self.handler(req);
+            return self.handler(response_writer, req);
         }
 
         const current = self.get_middleware(self.index);
         self.index += 1;
 
-        try current(req, self);
+        try current(response_writer, req, self);
     }
 };
 
@@ -459,6 +485,20 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
             },
         };
 
+        var response = Response.HttpResponse{
+            .headers = .{
+                .allocator = req_alloc,
+                .headers = .empty,
+            },
+            .allocator = req_alloc,
+            .request = &head,
+        };
+        defer {
+            response.finish() catch {};
+        }
+
+        const response_writer = response.Response();
+
         var request = Request{
             .allocator = req_alloc,
             .io = io,
@@ -474,7 +514,6 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
         var params_len: usize = 0;
 
         const path = stripQuery(head.head.target);
-        std.debug.print("PTH={s}\n", .{path});
         const match = server.router.find(
             path,
             head.head.method,
@@ -507,7 +546,7 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
             .route = match.route.middlewares.items,
             .handler = match.handler,
         };
-        chain.call(&request) catch |err| {
+        chain.call(response_writer, &request) catch |err| {
             std.debug.print("HANDLER ERROR={any}\n", .{err});
             head.respond("INTERNAL SERVER ERROR\n", .{
                 .status = .internal_server_error,

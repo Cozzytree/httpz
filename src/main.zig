@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const httpz = @import("httpz");
 
-fn handle_user(req: *httpz.Request) !void {
+fn handle_user(_: httpz.ResponseWriter, req: *httpz.Request) !void {
     std.debug.print("{any}\n", .{req.method()});
     if (req.state(AppState)) |state| {
         std.debug.print("app name={s}\n", .{state.name});
@@ -11,7 +11,7 @@ fn handle_user(req: *httpz.Request) !void {
     try req.raw.respond("Hello from user", .{ .status = .ok });
 }
 
-fn handle_user_id(req: *httpz.Request) !void {
+fn handle_user_id(_: httpz.ResponseWriter, req: *httpz.Request) !void {
     if (req.get([]const u8, "userId")) |userId| {
         std.debug.print("userId {s}\n", .{userId.*});
         var buf: [100]u8 = undefined;
@@ -25,7 +25,7 @@ fn handle_user_id(req: *httpz.Request) !void {
     }
 }
 
-fn logger(req: *httpz.Request, next: *httpz.Next) !void {
+fn logger(_: httpz.ResponseWriter, req: *httpz.Request, next: *httpz.Next) !void {
     if (req.param("id")) |userId| {
         try req.set("userId", @ptrCast(&userId));
     }
@@ -41,25 +41,25 @@ fn logger(req: *httpz.Request, next: *httpz.Next) !void {
     }
 }
 
-fn logger1(req: *httpz.Request, next: *httpz.Next) !void {
+fn logger1(_: httpz.ResponseWriter, req: *httpz.Request, next: *httpz.Next) !void {
     std.debug.print("from middleware 1\n", .{});
     try next.call(req);
     std.debug.print("leaving middleware 1\n", .{});
 }
 
-fn logger2(req: *httpz.Request, next: *httpz.Next) !void {
+fn logger2(_: httpz.ResponseWriter, req: *httpz.Request, next: *httpz.Next) !void {
     std.debug.print("from middleware 2\n", .{});
     try next.call(req);
     std.debug.print("leaving middleware 2\n", .{});
 }
 
-fn logger3(req: *httpz.Request, next: *httpz.Next) !void {
+fn logger3(_: httpz.ResponseWriter, req: *httpz.Request, next: *httpz.Next) !void {
     std.debug.print("from middleware 3\n", .{});
     try next.call(req);
     std.debug.print("leaving middleware 3\n", .{});
 }
 
-fn logger4(req: *httpz.Request, next: *httpz.Next) !void {
+fn logger4(_: httpz.ResponseWriter, req: *httpz.Request, next: *httpz.Next) !void {
     std.debug.print("from middleware 4\n", .{});
     try next.call(req);
 }
@@ -69,20 +69,26 @@ const AppState = struct {
     log_file: Io.File,
 };
 
-fn api_handler(req: *httpz.Request) !void {
+fn api_handler(_: httpz.ResponseWriter, req: *httpz.Request) !void {
     try req.raw.respond("Hello from API\n", .{});
 }
 
-fn user_handler(req: *httpz.Request) !void {
+fn user_handler(_: httpz.ResponseWriter, req: *httpz.Request) !void {
     try req.raw.respond("Hello from USER API\n", .{});
 }
 
-fn home(req: *httpz.Request) !void {
+fn home(w: httpz.ResponseWriter, req: *httpz.Request) !void {
     _ = req.query("");
     for (req.queries.items) |page| {
         std.debug.print("{s}={s}\n", .{ page.key, page.value });
     }
-    try req.raw.respond("OK", .{});
+
+    try w.header().set("APPLE", "DAPLE");
+    try w.header().set("APPLE", "MAPLE");
+    w.writeHeader(200);
+
+    _ = try w.write("Hello ");
+    _ = try w.write(" World");
 }
 
 const User = struct {
@@ -90,12 +96,12 @@ const User = struct {
     password: []const u8,
 };
 
-fn createUser(req: *httpz.Request) !void {
+fn createUser(_: httpz.ResponseWriter, req: *httpz.Request) !void {
     const body = try req.jsonBody(User);
     try req.respondJson(body);
 }
 
-fn user(req: *httpz.Request) !void {
+fn user(_: httpz.ResponseWriter, req: *httpz.Request) !void {
     const id = req.param("id").?;
     try req.setCookie(.{ .name = "apple", .value = "maple" });
     try req.respondJson(.{
