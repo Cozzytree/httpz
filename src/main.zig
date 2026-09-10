@@ -96,17 +96,96 @@ const User = struct {
     password: []const u8,
 };
 
-fn createUser(_: httpz.ResponseWriter, req: *httpz.Request) !void {
-    const body = try req.jsonBody(User);
-    try req.respondJson(body);
+fn createUser(w: httpz.ResponseWriter, req: *httpz.Request) !void {
+    req.close_connection = true;
+    const body = try req.jsonBodyParsed(User);
+    defer body.deinit();
+    std.debug.print("USERNAME={s}, PASSWORD={s}\n", .{
+        body.value.username,
+        body.value.password,
+    });
+    // var buff: [1024]u8 = undefined;
+    // var reader = try req.body(&buff);
+    // while (try reader.takeDelimiter('\n')) |line| {
+    //     std.debug.print("line={s}\n", .{line});
+    // }
+    _ = try w.write("OK\n");
+    w.writeHeader(201);
 }
 
-fn user(_: httpz.ResponseWriter, req: *httpz.Request) !void {
-    const id = req.param("id").?;
-    try req.setCookie(.{ .name = "apple", .value = "maple" });
-    try req.respondJson(.{
-        .userId = id,
-    });
+fn user(w: httpz.ResponseWriter, req: *httpz.Request) !void {
+    try w.header().set("Content-Type", "text/html; charset=utf-8");
+
+    _ = try w.write(
+        \\<!DOCTYPE html>
+        \\<html>
+        \\<body>
+        \\<h1>Streaming Test</h1>
+    );
+
+    try w.flush();
+
+    try req.io.sleep(.fromSeconds(2), .real);
+
+    var buf: [64 * 1024]u8 = undefined;
+    @memset(&buf, 'A');
+
+    _ = try w.write(buf[0..]);
+
+    _ = try w.write(
+        \\<div style="font-size:40px">
+        \\FIRST CHUNK ARRIVED
+        \\</div>
+    );
+
+    try w.flush();
+
+    try req.io.sleep(.fromSeconds(2), .real);
+
+    _ = try w.write(
+        \\<div style="font-size:40px">
+        \\SECOND CHUNK ARRIVED
+        \\</div>
+    );
+
+    try w.flush();
+
+    try req.io.sleep(.fromSeconds(2), .real);
+
+    _ = try w.write(
+        \\<div style="font-size:40px">
+        \\THIRD CHUNK ARRIVED
+        \\</div>
+        \\</body>
+        \\</html>
+    );
+
+    try w.flush();
+}
+
+fn handleFile(w: httpz.ResponseWriter, req: *httpz.Request) !void {
+    const io = req.io;
+    const cwd = Io.Dir.cwd();
+    const file = try cwd.openFile(
+        io,
+        "./src/main.zig",
+        .{ .mode = .read_only },
+    );
+    defer file.close(io);
+
+    var read_buffer: [8 * 1024]u8 = undefined;
+    var reader = file.reader(io, &read_buffer);
+
+    var buffer: [1024]u8 = undefined;
+    while (true) {
+        const len = reader.interface.readSliceShort(&buffer) catch |err| switch (err) {
+            error.ReadFailed => return err,
+        };
+        if (len == 0) break;
+
+        _ = try w.write(buffer[0..len]);
+        // try w.flush();
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -124,10 +203,11 @@ pub fn main(init: std.process.Init) !void {
         .read_header_timeout = 2000,
     });
 
+    std.debug.print("Server listening in port {d}\n", .{3000});
     try server.GET("/", home);
     try server.GET("/users", handle_user);
     try server.GET("/users/:id", user);
-    std.debug.print("Server listening in port {d}\n", .{3000});
+    try server.GET("/file", handleFile);
 
     var api = server.GROUP("/api");
     try api.GET("/", api_handler);

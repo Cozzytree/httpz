@@ -5,6 +5,8 @@ const Method = std.http.Method;
 const Headers = @import("./header.zig");
 const Response = @import("response.zig");
 
+const DEFAULT_MAX_HEADER_SIZE = 1 << 20;
+
 pub const Error = error{
     InvalidJson,
     PayloadTooLarge,
@@ -18,6 +20,7 @@ pub const ResponseWriter = struct {
         header: *const fn (ptr: *anyopaque) *Headers,
         write: *const fn (ptr: *anyopaque, data: []const u8) anyerror!usize,
         writeHeader: *const fn (ptr: *anyopaque, status: u16) void,
+        flush: *const fn (ptr: *anyopaque) anyerror!void,
     };
 
     pub fn header(self: ResponseWriter) *Headers {
@@ -30,6 +33,10 @@ pub const ResponseWriter = struct {
 
     pub fn writeHeader(self: ResponseWriter, status: u16) void {
         self.vtable.writeHeader(self.ptr, status);
+    }
+
+    pub fn flush(self: ResponseWriter) anyerror!void {
+        try self.vtable.flush(self.ptr);
     }
 };
 
@@ -58,6 +65,8 @@ const Query = struct {
 };
 
 pub const Request = struct {
+    close_connection: bool = false,
+
     _body_cache: ?[]const u8 = null,
     max_body_size: usize = 1024 * 1024,
     io: std.Io,
@@ -221,10 +230,6 @@ pub const Request = struct {
         return @ptrCast(@alignCast(value));
     }
 
-    pub fn rawBody(_: *Request) ![]const u8 {
-        return null;
-    }
-
     // utitlities
     pub fn redirect(self: *const Request, uri: []const u8, status: std.http.Status) !void {
         try self.raw.respond("", .{
@@ -235,14 +240,13 @@ pub const Request = struct {
         });
     }
 
-    pub fn body(self: *Request) ![]const u8 {
-        if (self._body_cache) |cached_body| {
-            return cached_body;
-        }
+    pub fn body(self: *Request, buff: []u8) !*Io.Reader {
+        return self.raw.readerExpectContinue(buff);
+    }
 
-        var transfer_buff: [4096]u8 = undefined;
-        var reader = try self.raw.readerExpectContinue(&transfer_buff);
-
+    pub fn jsonBodyParsed(self: *Request, comptime T: type) !std.json.Parsed(T) {
+        var buff: [4096]u8 = undefined;
+        const reader = try self.body(&buff);
         const data = reader.allocRemaining(
             self.allocator,
             .limited(self.max_body_size),
@@ -251,48 +255,42 @@ pub const Request = struct {
             else => return err,
         };
 
-        self._body_cache = data;
-        return data;
-    }
-
-    pub fn jsonBody(self: *Request, comptime T: type) !T {
-        const data = try self.body();
         const parsed = try std.json.parseFromSlice(
             T,
             self.allocator,
             data,
             .{ .ignore_unknown_fields = true },
         );
-        return parsed.value;
+        return parsed;
     }
 
-    pub fn respondJson(self: *Request, value: anytype) !void {
-        var writer = Io.Writer.Allocating.init(self.allocator);
+    // pub fn respondJson(self: *Request, value: anytype) !void {
+    //     var writer = Io.Writer.Allocating.init(self.allocator);
 
-        var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-        try json.write(value);
+    //     var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    //     try json.write(value);
 
-        var headers = std.ArrayListUnmanaged(std.http.Header).empty;
+    //     var headers = std.ArrayListUnmanaged(std.http.Header).empty;
 
-        var cookie_storage = Io.Writer.Allocating.init(self.allocator);
+    //     var cookie_storage = Io.Writer.Allocating.init(self.allocator);
 
-        for (self.response_cookies.items) |res_cookie| {
-            const start = cookie_storage.written().len;
-            try write_cookie(&cookie_storage.writer, res_cookie);
+    //     for (self.response_cookies.items) |res_cookie| {
+    //         const start = cookie_storage.written().len;
+    //         try write_cookie(&cookie_storage.writer, res_cookie);
 
-            const end = cookie_storage.written().len;
-            try headers.append(self.allocator, .{
-                .name = "Set-Cookie",
-                .value = cookie_storage.written()[start..end],
-            });
-        }
-        try headers.append(self.allocator, .{ .name = "Content-Type", .value = "application/json" });
+    //         const end = cookie_storage.written().len;
+    //         try headers.append(self.allocator, .{
+    //             .name = "Set-Cookie",
+    //             .value = cookie_storage.written()[start..end],
+    //         });
+    //     }
+    //     try headers.append(self.allocator, .{ .name = "Content-Type", .value = "application/json" });
 
-        try self.raw.respond(writer.written(), .{
-            .status = .ok,
-            .extra_headers = headers.items,
-        });
-    }
+    //     try self.raw.respond(writer.written(), .{
+    //         .status = .ok,
+    //         .extra_headers = headers.items,
+    //     });
+    // }
 };
 
 pub const Handler = *const fn (ResponseWriter, *Request) anyerror!void;
@@ -338,6 +336,7 @@ const Options = struct {
     app_state: ?*anyopaque,
     max_body_size: usize = 1024 * 1024,
     read_header_timeout: ?i64 = null,
+    max_header_bytes: ?usize = null,
 };
 
 const Group = struct {
@@ -402,6 +401,7 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     read_header_timeout: ?i64 = null,
     max_body_size: usize,
+    max_header_bytes: usize = DEFAULT_MAX_HEADER_SIZE,
 
     pub fn init(options: Options) !Server {
         return .{
@@ -411,6 +411,7 @@ pub const Server = struct {
             .app_state = options.app_state,
             .max_body_size = options.max_body_size,
             .read_header_timeout = options.read_header_timeout,
+            .max_header_bytes = options.max_header_bytes orelse DEFAULT_MAX_HEADER_SIZE,
         };
     }
 
@@ -470,53 +471,25 @@ const Result = union(enum) {
 fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Canceled}!void {
     defer stream.close(io);
 
-    var read_buffer: [4096]u8 = undefined;
+    var storage: [DEFAULT_MAX_HEADER_SIZE]u8 = undefined;
+    const read_buffer = storage[0..server.max_header_bytes];
     var write_buffer: [4096]u8 = undefined;
 
     var arena = std.heap.ArenaAllocator.init(server.allocator);
     defer arena.deinit();
 
     var writer = stream.writer(io, &write_buffer);
-    var reader = stream.reader(io, &read_buffer);
+    var reader = stream.reader(io, read_buffer);
     var http_server: std.http.Server = .init(&reader.interface, &writer.interface);
 
     while (http_server.reader.state == .ready) {
         defer _ = arena.reset(.retain_capacity);
         const req_alloc = arena.allocator();
 
-        var storage: [2]Result = undefined;
-        var select = Io.Select(Result).init(io, &storage);
-        defer _ = select.cancel();
-
-        select.concurrent(.request, receiveHeadTask, .{&http_server}) catch {
+        var head = recieveHead(
+            &http_server,
+        ) catch {
             return error.Canceled;
-        };
-
-        if (server.read_header_timeout) |timeout_ms| {
-            select.concurrent(
-                .timeout,
-                timeoutTask,
-                .{
-                    io,
-                    Io.Duration.fromMilliseconds(timeout_ms),
-                },
-            ) catch {
-                return error.Canceled;
-            };
-        }
-
-        var head = switch (try select.await()) {
-            .request => |req| req catch {
-                return error.Canceled;
-            },
-
-            .timeout => |res| {
-                res catch {
-                    return error.Canceled;
-                };
-                std.log.debug("header timeout", .{});
-                return;
-            },
         };
 
         var response = Response.HttpResponse{
@@ -527,10 +500,6 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
             .allocator = req_alloc,
             .request = &head,
         };
-        defer {
-            response.finish() catch {};
-        }
-
         const response_writer = response.Response();
 
         var request = Request{
@@ -540,7 +509,17 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
             .app_state = server.app_state,
             .max_body_size = server.max_body_size,
         };
-        defer request.deinit();
+
+        defer {
+            if (request.close_connection and
+                response.state != .streaming and
+                response.state != .finished)
+            {
+                response_writer.header().set("Connection", "close") catch {};
+            }
+            request.deinit();
+            response.finish() catch {};
+        }
 
         const params_buf = req_alloc.alloc(Param, 100) catch {
             return error.Canceled;
@@ -570,7 +549,6 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
                 };
                 return;
             },
-            // else => return error.Canceled,
         };
 
         request.params = params_buf[0..params_len];
@@ -600,6 +578,32 @@ fn timeoutTask(io: Io, duration: Io.Duration) Io.Cancelable!void {
     try io.sleep(duration, .real);
 }
 
+fn recieveHead(http_server: *std.http.Server) !std.http.Server.Request {
+    return http_server.receiveHead();
+}
+
+fn recieveHeadWithTimeout(io: Io, http_server: *std.http.Server, timeout: ?i64) !std.http.Server.Request {
+    // var now = Io.Timestamp.now(io, .real);
+    var storage: [2]Result = undefined;
+    var select = Io.Select(Result).init(io, &storage);
+    defer _ = select.cancel();
+
+    select.async(.request, receiveHeadTask, .{http_server});
+    if (timeout) |ms| {
+        select.async(.timeout, timeoutTask, .{
+            io,
+            Io.Duration.fromMilliseconds(ms),
+        });
+    }
+
+    return switch (try select.await()) {
+        .request => |req| try req,
+        .timeout => {
+            return error.HeaderTimeout;
+        },
+    };
+}
+
 fn stripQuery(target: []const u8) []const u8 {
     return if (std.mem.indexOfScalar(u8, target, '?')) |idx|
         target[0..idx]
@@ -622,3 +626,4 @@ fn write_cookie(writer: *Io.Writer, cookie: ResponseCookie) !void {
 
     if (cookie.same_site) |same_site| try writer.print("; SameSite={s}", .{same_site});
 }
+

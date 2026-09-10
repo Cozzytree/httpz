@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const Headers = @import("./header.zig");
 const httpz = @import("./root.zig");
+const STREAM_THRESHOLD = 8 * 1024;
 
 const ResponseState = union(enum) {
     idle,
@@ -15,18 +16,12 @@ const ResponseState = union(enum) {
 };
 
 pub const HttpResponse = struct {
-    const STREAM_THRESHOLD = 8 * 1024;
-
     state: ResponseState = .idle,
     body: std.ArrayListUnmanaged(u8) = .empty,
-
-    streaming: bool = false,
 
     headers: Headers,
     stream_buffer: [4096]u8 = undefined,
     status: u16 = 200,
-    body_writer: ?std.http.BodyWriter = null,
-    header_written: bool = false,
     request: *std.http.Server.Request,
     allocator: std.mem.Allocator,
 
@@ -74,9 +69,8 @@ pub const HttpResponse = struct {
                         .extra_headers = headers,
                     } },
                 );
-                try body_writer.writer.writeAll(
-                    buf.body.items,
-                );
+                try body_writer.writer.writeAll(buf.body.items);
+                try body_writer.writer.flush();
 
                 buf.body.deinit(self.allocator);
                 self.state = .{
@@ -87,19 +81,6 @@ pub const HttpResponse = struct {
             },
             else => return,
         }
-        if (self.streaming) return;
-        // const headers = try self.headers.generate_headers(self.allocator);
-        // self.body_writer = try self.request.respondStreaming(&self.stream_buffer, .{
-        //     .respond_options = .{
-        //         .status = @enumFromInt(self.status),
-        //         .extra_headers = headers,
-        //     },
-        // });
-        // self.streaming = true;
-        // try self.body_writer.?.writer.writeAll(
-        //     self.body.items,
-        // );
-        // self.body.clearRetainingCapacity();
     }
 
     fn writeImpl(self: *Self, content: []const u8) !usize {
@@ -111,7 +92,7 @@ pub const HttpResponse = struct {
                 return content.len;
             },
             .buffering => |*buf| {
-                const new_len = self.body.items.len + content.len;
+                const new_len = buf.body.items.len + content.len;
                 if (new_len <= STREAM_THRESHOLD) {
                     try buf.body.appendSlice(self.allocator, content);
                 } else {
@@ -120,7 +101,9 @@ pub const HttpResponse = struct {
                 }
             },
             .streaming => |*stream| {
-                try stream.writer.writer.writeAll(content);
+                const i = try stream.writer.writer.write(content);
+                stream.writer.writer.flush() catch {};
+                return i;
             },
             .finished => {
                 return error.ResponseAlreadyFinished;
@@ -136,8 +119,39 @@ pub const HttpResponse = struct {
 
     fn writeHeader(ptr: *anyopaque, status: u16) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        if (self.header_written) return;
-        self.status = status;
+        switch (self.state) {
+            .idle => self.status = status,
+            .buffering => self.status = status,
+            .streaming => {
+                std.log.warn("Headers :already sent\n", .{});
+            },
+            .finished => {
+                std.log.warn(
+                    "WriteHeader called after response finished",
+                    .{},
+                );
+            },
+        }
+    }
+
+    fn flush(ptr: *anyopaque) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        switch (self.state) {
+            .idle => {
+                try self.promoteToStreaming();
+            },
+            .buffering => {
+                try self.promoteToStreaming();
+            },
+            .streaming => |*stream| {
+                stream.writer.writer.flush() catch |err| {
+                    return err;
+                };
+            },
+            .finished => {
+                return error.ResponseAlreadyFinished;
+            },
+        }
     }
 
     pub fn Response(self: *Self) httpz.ResponseWriter {
@@ -147,6 +161,7 @@ pub const HttpResponse = struct {
                 .header = header,
                 .write = write,
                 .writeHeader = writeHeader,
+                .flush = flush,
             },
         };
     }
