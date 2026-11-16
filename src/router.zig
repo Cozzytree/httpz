@@ -209,6 +209,7 @@ test "register route" {
     const allocator = std.testing.allocator;
     const handler = struct {
         fn handle(
+            _: httpz.ResponseWriter,
             request: *httpz.Request,
         ) anyerror!void {
             _ = request;
@@ -302,7 +303,7 @@ test "find root route" {
     defer router.deinit(allocator);
 
     const handler = struct {
-        fn handle(_: *httpz.Request) !void {}
+        fn handle(_: httpz.ResponseWriter, _: *httpz.Request) !void {}
     }.handle;
 
     try router.register(
@@ -334,7 +335,7 @@ test "find static route" {
     defer params.deinit(allocator);
 
     const handler = struct {
-        fn handle(_: *httpz.Request) !void {}
+        fn handle(_: httpz.ResponseWriter, _: *httpz.Request) !void {}
     }.handle;
 
     try router.register(
@@ -366,7 +367,7 @@ test "find param route" {
     defer params.deinit(allocator);
 
     const handler = struct {
-        fn handle(_: *httpz.Request) !void {}
+        fn handle(_: httpz.ResponseWriter, _: *httpz.Request) !void {}
     }.handle;
 
     try router.register(
@@ -402,7 +403,7 @@ test "find nested params" {
     defer router.deinit(allocator);
 
     const handler = struct {
-        fn handle(_: *httpz.Request) !void {}
+        fn handle(_: httpz.ResponseWriter, _: *httpz.Request) !void {}
     }.handle;
 
     try router.register(
@@ -461,11 +462,11 @@ test "same path different methods" {
     defer router.deinit(allocator);
 
     const get_handler = struct {
-        fn handle(_: *httpz.Request) !void {}
+        fn handle(_: httpz.ResponseWriter, _: *httpz.Request) !void {}
     }.handle;
 
     const post_handler = struct {
-        fn handle(_: *httpz.Request) !void {}
+        fn handle(_: httpz.ResponseWriter, _: *httpz.Request) !void {}
     }.handle;
 
     try router.register(
@@ -510,7 +511,7 @@ test "method not allowed" {
     defer router.deinit(allocator);
 
     const handler = struct {
-        fn handle(_: *httpz.Request) !void {}
+        fn handle(_: httpz.ResponseWriter, _: *httpz.Request) !void {}
     }.handle;
 
     try router.register(
@@ -564,11 +565,11 @@ test "static route takes precedence over param" {
     defer params.deinit(allocator);
 
     const static_handler = struct {
-        fn handle(_: *httpz.Request) !void {}
+        fn handle(_: httpz.ResponseWriter, _: *httpz.Request) !void {}
     }.handle;
 
     const param_handler = struct {
-        fn handle2(_: *httpz.Request) !void {}
+        fn handle2(_: httpz.ResponseWriter, _: *httpz.Request) !void {}
     }.handle2;
 
     try router.register(

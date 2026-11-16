@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const zio = @import("zio");
 const httpz = @import("httpz");
 
 fn handle_user(_: httpz.ResponseWriter, req: *httpz.Request) !void {
@@ -25,19 +26,19 @@ fn handle_user_id(_: httpz.ResponseWriter, req: *httpz.Request) !void {
     }
 }
 
-fn logger(_: httpz.ResponseWriter, req: *httpz.Request, next: *httpz.Next) !void {
+fn logger(res: httpz.ResponseWriter, req: *httpz.Request, next: *httpz.Next) !void {
     if (req.param("id")) |userId| {
         try req.set("userId", @ptrCast(&userId));
     }
 
     if (req.state(AppState)) |state| {
-        try next.call(req);
+        try next.call(res, req);
         var buf: [256]u8 = undefined;
         var writer = state.log_file.writer(req.io, &buf);
         try writer.interface.print("{s} {any}\n", .{ req.path(), req.method() });
         try writer.interface.flush();
     } else {
-        try next.call(req);
+        try next.call(res, req);
     }
 }
 
@@ -188,8 +189,19 @@ fn handleFile(w: httpz.ResponseWriter, req: *httpz.Request) !void {
     }
 }
 
-pub fn main(init: std.process.Init) !void {
-    const io = init.io;
+pub fn main(_: std.process.Init.Minimal) !void {
+    const c_alloc = std.heap.c_allocator;
+
+    const rt = try zio.Runtime.init(c_alloc, .{});
+    defer rt.deinit();
+
+    const io = rt.io();
+
+    // var threaded: std.Io.Threaded = .init(c_alloc, .{
+    //     .argv0 = .empty,
+    // });
+    // const io = threaded.io();
+
     var app_state = AppState{
         .name = "Cozzycode",
         .log_file = Io.File.stdout(),
@@ -198,10 +210,12 @@ pub fn main(init: std.process.Init) !void {
     var server = try httpz.Server.init(.{
         .host = "127.0.0.1",
         .port = 3000,
-        .allocator = init.gpa,
+        .allocator = c_alloc,
         .app_state = &app_state,
         .read_header_timeout = 2000,
     });
+
+    // try server.USE(logger);
 
     std.debug.print("Server listening in port {d}\n", .{3000});
     try server.GET("/", home);
@@ -210,6 +224,15 @@ pub fn main(init: std.process.Init) !void {
     try server.GET("/file", handleFile);
 
     var api = server.GROUP("/api");
+    var api_user = try api.GROUP("/users");
+    try api_user.GET(
+        "/",
+        struct {
+            pub fn handle(_: httpz.ResponseWriter, req: *httpz.Request) !void {
+                try req.raw.respond("Hello from users API\n", .{});
+            }
+        }.handle,
+    );
     try api.GET("/", api_handler);
 
     var user_api = try api.GROUP("/user");

@@ -447,7 +447,7 @@ pub const Server = struct {
             .reuse_address = true,
             .protocol = .tcp,
         });
-        var group = Io.Group.init;
+        var group: Io.Group = .init;
         defer group.cancel(io);
 
         while (true) {
@@ -457,8 +457,28 @@ pub const Server = struct {
                     continue;
                 },
             };
-
-            group.async(io, handle_connection, .{ io, self, stream });
+            // std.posix.setsockopt(
+            //     stream.socket.handle,
+            //     std.posix.SOL.SOCKET,
+            //     std.posix.SO.RCVTIMEO,
+            //     std.mem.asBytes(&self.read_header_timeout),
+            // ) catch |err| {
+            //     std.debug.print("error setting revieve timeout {s}\n", .{@errorName(err)});
+            // };
+            // std.posix.setsockopt(
+            //     stream.socket.handle,
+            //     std.posix.SOL.SOCKET,
+            //     std.posix.SO.SNDTIMEO,
+            //     std.mem.asBytes(&self.read_header_timeout),
+            // ) catch |err| {
+            //     std.debug.print("error setting send timeout {s}\n", .{@errorName(err)});
+            // };
+            group.concurrent(io, handle_connection, .{ io, self, stream }) catch |err| switch (err) {
+                Io.ConcurrentError.ConcurrencyUnavailable => {
+                    std.debug.print("error {any}\n", .{err});
+                    std.process.exit(1);
+                },
+            };
         }
     }
 };
@@ -491,6 +511,13 @@ fn handle_connection(io: Io, server: *Server, stream: Io.net.Stream) error{Cance
         ) catch {
             return error.Canceled;
         };
+
+        if (head.head.method.requestHasBody() and
+            head.head.transfer_encoding == .none and
+            head.head.content_length == null)
+        {
+            head.head.keep_alive = false;
+        }
 
         var response = Response.HttpResponse{
             .headers = .{
@@ -627,3 +654,42 @@ fn write_cookie(writer: *Io.Writer, cookie: ResponseCookie) !void {
     if (cookie.same_site) |same_site| try writer.print("; SameSite={s}", .{same_site});
 }
 
+test "nested grouping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var server = try Server.init(.{
+        .host = "127.0.0.1",
+        .port = 0,
+        .allocator = allocator,
+        .app_state = null,
+    });
+    defer server.router.deinit(allocator);
+
+    const handler = struct {
+        fn handle(_: ResponseWriter, _: *Request) !void {}
+    }.handle;
+
+    var api = server.GROUP("/api");
+    var v1 = try api.GROUP("/v1");
+    var admin = try v1.GROUP("/admin");
+    var users = try admin.GROUP("/users");
+
+    try users.GET("/:id/profile", handler);
+
+    var params: [8]Param = undefined;
+    var params_len: usize = 0;
+
+    const match = try server.router.find(
+        "/api/v1/admin/users/42/profile",
+        .GET,
+        &params,
+        &params_len,
+    );
+
+    try std.testing.expect(match.handler == handler);
+    try std.testing.expectEqual(@as(usize, 1), params_len);
+    try std.testing.expectEqualStrings("id", params[0].key);
+    try std.testing.expectEqualStrings("42", params[0].value);
+}
